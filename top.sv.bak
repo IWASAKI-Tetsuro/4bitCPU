@@ -1,0 +1,132 @@
+module top(
+  input  logic       pin_clock,
+  input  logic       pin_n_reset,
+  input  logic [3:0] pin_switch,
+  output logic [3:0] pin_led
+);
+  logic clk;
+  prescaler #(.RATIO(100_000_000)) prescaler(
+    .quick_clock(pin_clock),
+    .slow_clock(clk)
+  );
+
+  mother_board mother_board(.clk, .n_reset(pin_n_reset), .switch(pin_switch), .led(pin_led));
+endmodule
+
+module mother_board(
+  input  logic       clk,
+  input  logic       n_reset,
+  input  logic [3:0] switch,
+  output logic [3:0] led
+);
+  logic [3:0] addr;
+  logic [7:0] data;
+
+  cpu cpu(.clk, .n_reset, .addr, .data, .switch, .led);
+  rom rom(.addr, .data);
+endmodule
+
+module prescaler #(parameter RATIO = 2) (
+  input  logic quick_clock,
+  output logic slow_clock
+);
+  logic [31:0] counter, next_counter;
+  logic inv;
+  assign inv = (counter == (RATIO/2 - 1));
+
+  assign next_counter = inv ? 32'd0 : counter + 32'd1;
+  always_ff @(posedge quick_clock) counter <= next_counter;
+
+  logic next_slow_clock;
+  assign next_slow_clock = inv ? ~slow_clock : slow_clock;
+  always_ff @(posedge quick_clock) slow_clock <= next_slow_clock;
+endmodule
+module cpu(
+  input  logic       clk,
+  input  logic       n_reset,
+  output logic [3:0] addr,
+  input  logic [7:0] data,
+  input  logic [3:0] switch,
+  output logic [3:0] led
+);
+
+  // a, b等はDFFのQワイヤーで、現在のレジスタの値に対応
+  // next_a, next_b等はDFFのDワイヤーで、次回のレジスタの値に対応
+  logic [3:0] a,   next_a;   // 汎用レジスタ
+  logic [3:0] b,   next_b;   // 汎用レジスタ
+  logic       cf,  next_cf;  // キャリーフラグ
+  logic [3:0] ip,  next_ip;  // 命令ポインタ
+  logic [3:0] out, next_out; // LEDに接続する
+
+  // DFFの接続
+  always_ff @(posedge clk) begin
+    if (~n_reset) begin
+      a   <= '0;
+      b   <= '0;
+      cf  <= '0;
+      ip  <= '0;
+      out <= '0;
+    end else begin
+      a   <= next_a;
+      b   <= next_b;
+      cf  <= next_cf;
+      ip  <= next_ip;
+      out <= next_out;
+    end
+  end
+
+  // ポートの整備
+  logic [3:0] opecode, imm;   // ADDやMOV等の命令と、即値を表すワイヤー
+  assign opecode = data[7:4]; // romから受け取ったデータのMSB側を、命令として解釈
+  assign imm     = data[3:0]; // romから受け取ったデータのLSB側を、即値として解釈
+  assign addr    = ip;        // 命令ポインタの値を、アドレスとしてromに渡す
+  assign led     = out;       // LEDをoutレジスタで制御
+
+  // 次回のレジスタの値(next系ワイヤー)を計算する組合回路
+  // 真理値表の上塗りを使ってコーディングする
+  always_comb begin
+    // next系ワイヤーの値をNOP命令の結果にする
+    next_a   = a;         // 汎用レジスタは現在の値のままにする
+    next_b   = b;         // 汎用レジスタは現在の値のままにする
+    next_cf  = 1'b0;      // キャリーフラグは0にリセットする
+    next_ip  = ip + 4'd1; // 命令ポインタは1増やす
+    next_out = out;       // LEDは現在の値のままにする
+
+    // next系ワイヤーの値を上塗りして、ADDやMOV等の結果にする
+    unique case (opecode)
+      4'b0000: {next_cf, next_a} = a + imm;     // ADD A, IMM
+      4'b0101: {next_cf, next_b} = b + imm;     // ADD B, IMM
+      4'b0011: next_a   = imm;                  // MOV A, IMM
+      4'b0111: next_b   = imm;                  // MOV B, IMM
+      4'b0001: next_a   = b;                    // MOV A, B
+      4'b0100: next_b   = a;                    // MOV B, A
+      4'b1111: next_ip  = imm;                  // JMP IMM
+      4'b1110: next_ip  = cf ? ip + 4'd1 : imm; // JNC IMM
+      4'b0010: next_a   = switch;               // IN  A
+      4'b0110: next_b   = switch;               // IN  B
+      4'b1001: next_out = b;                    // OUT B
+      4'b1011: next_out = imm;                  // OUT IMM
+      default: ;
+    endcase
+  end
+endmodule
+module rom(
+  input  logic [3:0] addr,
+  output logic [7:0] data
+);
+  always_comb begin
+    case (addr)                     // addr  data   assembler
+      4'b0000: data = 8'b0110_0000; // 0     8'h60  IN  B
+      4'b0001: data = 8'b1001_0000; // 1     8'h90  OUT B
+      4'b0010: data = 8'b0011_1101; // 2     8'h3D  MOV A, 13
+      4'b0011: data = 8'b0000_0001; // 3     8'h01  ADD A, 1
+      4'b0100: data = 8'b1110_0011; // 4     8'hE3  JNC    3
+      4'b0101: data = 8'b0101_0001; // 5     8'h51  ADD B, 1
+      4'b0110: data = 8'b1110_0001; // 6     8'hE1  JNC    1
+      4'b0111: data = 8'b1011_0000; // 7     8'hB0  OUT    0
+      4'b1000: data = 8'b1011_1111; // 8     8'hBF  OUT    15
+      4'b1001: data = 8'b1111_0111; // 9     8'hF7  JMP    7
+      default: data = 8'b0000_0000;
+    endcase
+  end
+endmodule
